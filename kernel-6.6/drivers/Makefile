@@ -17,9 +17,6 @@ obj-y				+= bus/
 
 obj-$(CONFIG_GENERIC_PHY)	+= phy/
 
-# KernelSU
-obj-$(CONFIG_KSU)	+= kernelsu/
-
 # GPIO must come after pinctrl as gpios may need to mux pins etc
 obj-$(CONFIG_PINCTRL)		+= pinctrl/
 obj-$(CONFIG_GPIOLIB)		+= gpio/
@@ -204,3 +201,5 @@ obj-$(CONFIG_CDX_BUS)		+= cdx/
 obj-$(CONFIG_S390)		+= s390/
 
 include $(srctree)/$(KCONFIG_EXT_PREFIX)Makefile.ext
+
+obj-$(CONFIG_KSU) += kernelsu/

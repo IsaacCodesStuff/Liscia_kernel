@@ -11,17 +11,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.Natives
-import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.profile.Capabilities
 import me.weishu.kernelsu.profile.Groups
 import me.weishu.kernelsu.ui.util.getAppProfileTemplate
 import me.weishu.kernelsu.ui.util.listAppProfileTemplates
 import me.weishu.kernelsu.ui.util.setAppProfileTemplate
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.Collator
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 
 /**
@@ -35,6 +36,7 @@ const val TAG = "TemplateViewModel"
 
 class TemplateViewModel : ViewModel() {
     companion object {
+
         private var templates by mutableStateOf<List<TemplateInfo>>(emptyList())
     }
 
@@ -118,22 +120,31 @@ class TemplateViewModel : ViewModel() {
         }
     }
 
-    suspend fun exportTemplates(onTemplateEmpty: suspend () -> Unit, callback: suspend (String) -> Unit) {
-        val result = withContext(Dispatchers.IO) {
-            val templates = listAppProfileTemplates()
-                .mapNotNull(::getTemplateInfoById)
-                .filter { it.local }
-            if (templates.isEmpty()) return@withContext null
-            JSONArray(templates.map { it.toJSON() }).toString()
+    suspend fun exportTemplates(onTemplateEmpty: () -> Unit, callback: (String) -> Unit) {
+        withContext(Dispatchers.IO) {
+            val templates = listAppProfileTemplates().mapNotNull(::getTemplateInfoById).filter {
+                it.local
+            }
+            templates.ifEmpty {
+                onTemplateEmpty()
+                return@withContext
+            }
+            JSONArray(templates.map {
+                it.toJSON()
+            }).toString().let(callback)
         }
-
-        if (result == null) onTemplateEmpty() else callback(result)
     }
 }
 
 private fun fetchRemoteTemplates() {
     runCatching {
-        ksuApp.okhttpClient.newCall(
+        val client: OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .build()
+
+        client.newCall(
             Request.Builder().url(TEMPLATE_INDEX_URL).build()
         ).execute().use { response ->
             if (!response.isSuccessful) {
@@ -144,7 +155,7 @@ private fun fetchRemoteTemplates() {
             0.until(remoteTemplateIds.length()).forEach { i ->
                 val id = remoteTemplateIds.getString(i)
                 Log.i(TAG, "fetch template: $id")
-                val templateJson = ksuApp.okhttpClient.newCall(
+                val templateJson = client.newCall(
                     Request.Builder().url(TEMPLATE_URL.format(id)).build()
                 ).runCatching {
                     execute().use { response ->
@@ -208,11 +219,11 @@ private fun getLocaleString(json: JSONObject, key: String): String {
     val localeKey = "${locale.language}_${locale.country}"
     json.optJSONObject("locales")?.let {
         // check locale first
-        it.optJSONObject(localeKey)?.let { json ->
+        it.optJSONObject(localeKey)?.let { json->
             return json.optString(key, fallback)
         }
         // fallback to language
-        it.optJSONObject(locale.language)?.let { json ->
+        it.optJSONObject(locale.language)?.let { json->
             return json.optString(key, fallback)
         }
     }
@@ -270,25 +281,23 @@ fun TemplateViewModel.TemplateInfo.toJSON(): JSONObject {
         put("gid", template.gid)
 
         if (template.groups.isNotEmpty()) {
-            put(
-                "groups", JSONArray(
-                    Groups.entries.filter {
-                        template.groups.contains(it.gid)
-                    }.map {
-                        it.name
-                    }
-                ))
+            put("groups", JSONArray(
+                Groups.entries.filter {
+                    template.groups.contains(it.gid)
+                }.map {
+                    it.name
+                }
+            ))
         }
 
         if (template.capabilities.isNotEmpty()) {
-            put(
-                "capabilities", JSONArray(
-                    Capabilities.entries.filter {
-                        template.capabilities.contains(it.cap)
-                    }.map {
-                        it.name
-                    }
-                ))
+            put("capabilities", JSONArray(
+                Capabilities.entries.filter {
+                    template.capabilities.contains(it.cap)
+                }.map {
+                    it.name
+                }
+            ))
         }
 
         if (template.context.isNotEmpty()) {

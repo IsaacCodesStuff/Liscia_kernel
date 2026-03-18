@@ -1,39 +1,25 @@
-#include "linux/cred.h"
-#include "linux/sched.h"
-#include "linux/security.h"
+#include "selinux.h"
+#include "objsec.h"
 #include "linux/version.h"
-#include "selinux_defs.h"
 #include "../klog.h" // IWYU pragma: keep
-#include "../ksu.h"
 
-/*
- * Cached SID values for frequently checked contexts.
- * These are resolved once at init and used for fast u32 comparison
- * instead of expensive string operations on every check.
- *
- * A value of 0 means "no cached SID is available" for that context.
- * This covers both the initial "not yet cached" state and any case
- * where resolving the SID (e.g. via security_secctx_to_secid) failed.
- * In all such cases we intentionally fall back to the slower
- * string-based comparison path; this degrades performance only and
- * does not cause a functional failure.
- */
-static u32 cached_su_sid __read_mostly = 0;
-static u32 cached_zygote_sid __read_mostly = 0;
-static u32 cached_init_sid __read_mostly = 0;
-u32 ksu_file_sid __read_mostly = 0;
+#define KERNEL_SU_DOMAIN "u:r:su:s0"
 
-static int transive_to_domain(const char *domain, struct cred *cred)
+static int transive_to_domain(const char *domain)
 {
-	taskcred_sec_t *tsec;
+	struct cred *cred;
+	struct task_security_struct *tsec;
 	u32 sid;
 	int error;
 
-	tsec = (taskcred_sec_t *)selinux_cred(cred);
+	cred = (struct cred *)__task_cred(current);
+
+	tsec = cred->security;
 	if (!tsec) {
 		pr_err("tsec == NULL!\n");
 		return -1;
 	}
+
 	error = security_secctx_to_secid(domain, strlen(domain), &sid);
 	if (error) {
 		pr_info("security_secctx_to_secid %s -> sid: %d, error: %d\n",
@@ -48,157 +34,97 @@ static int transive_to_domain(const char *domain, struct cred *cred)
 	return error;
 }
 
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 19, 0)
-bool __maybe_unused
-is_ksu_transition(const struct task_security_struct *old_tsec,
-		  const struct task_security_struct *new_tsec)
-{
-	static u32 ksu_sid;
-	char *secdata;
-	int err;
-	u32 seclen;
-	bool allowed = false;
-
-	if (!ksu_sid) {
-		err = security_secctx_to_secid(
-			KERNEL_SU_CONTEXT, strlen(KERNEL_SU_CONTEXT), &ksu_sid);
-		pr_err("failed to get ksu_sid: %d\n", err);
-	}
-
-	if (security_secid_to_secctx(old_tsec->sid, &secdata, &seclen))
-		return false;
-
-	allowed = (!strcmp("u:r:init:s0", secdata) && new_tsec->sid == ksu_sid);
-	security_release_secctx(secdata, seclen);
-	return allowed;
-}
-#endif
-
 void setup_selinux(const char *domain)
 {
-	if (transive_to_domain(domain, (struct cred *)__task_cred(current))) {
+	if (transive_to_domain(domain)) {
 		pr_err("transive domain failed.\n");
 		return;
 	}
-}
 
-void setup_ksu_cred(void)
-{
-	if (ksu_cred && transive_to_domain(KERNEL_SU_CONTEXT, ksu_cred)) {
-		pr_err("setup ksu cred failed.\n");
-	}
+	/* we didn't need this now, we have change selinux rules when boot!
+if (!is_domain_permissive) {
+  if (set_domain_permissive() == 0) {
+      is_domain_permissive = true;
+  }
+}*/
 }
 
 void setenforce(bool enforce)
 {
-	do_setenforce(enforce);
+#ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+	selinux_state.enforcing = enforce;
+#endif
 }
 
-bool getenforce(void)
+bool getenforce()
 {
-	if (is_selinux_disabled()) {
+#ifdef CONFIG_SECURITY_SELINUX_DISABLE
+	if (selinux_state.disabled) {
 		return false;
 	}
+#endif
 
-	return is_selinux_enforcing();
+#ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+	return selinux_state.enforcing;
+#else
+	return true;
+#endif
 }
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)) &&                         \
+	!defined(KSU_COMPAT_HAS_CURRENT_SID)
 /*
- * Initialize cached SID values for frequently checked SELinux contexts.
- * Called once after SELinux policy is loaded (post-fs-data).
- * This eliminates expensive string comparisons in hot paths.
+ * get the subjective security ID of the current task
  */
-void cache_sid(void)
+static inline u32 current_sid(void)
 {
-	int err;
+	const struct task_security_struct *tsec = current_security();
 
-	err = security_secctx_to_secid(
-		KERNEL_SU_CONTEXT, strlen(KERNEL_SU_CONTEXT), &cached_su_sid);
-	if (err) {
-		pr_warn("Failed to cache kernel su domain SID: %d\n", err);
-		cached_su_sid = 0;
-	} else {
-		pr_info("Cached su SID: %u\n", cached_su_sid);
-	}
-
-	err = security_secctx_to_secid(ZYGOTE_CONTEXT, strlen(ZYGOTE_CONTEXT),
-				       &cached_zygote_sid);
-	if (err) {
-		pr_warn("Failed to cache zygote SID: %d\n", err);
-		cached_zygote_sid = 0;
-	} else {
-		pr_info("Cached zygote SID: %u\n", cached_zygote_sid);
-	}
-
-	err = security_secctx_to_secid(INIT_CONTEXT, strlen(INIT_CONTEXT),
-				       &cached_init_sid);
-	if (err) {
-		pr_warn("Failed to cache init SID: %d\n", err);
-		cached_init_sid = 0;
-	} else {
-		pr_info("Cached init SID: %u\n", cached_init_sid);
-	}
-
-	err = security_secctx_to_secid(KSU_FILE_CONTEXT,
-				       strlen(KSU_FILE_CONTEXT), &ksu_file_sid);
-	if (err) {
-		pr_warn("Failed to cache ksu_file SID: %d\n", err);
-		ksu_file_sid = 0;
-	} else {
-		pr_info("Cached ksu_file SID: %u\n", ksu_file_sid);
-	}
+	return tsec->sid;
 }
+#endif
 
-/*
- * Fast path: compare task's SID directly against cached value.
- * Falls back to string comparison if cache is not initialized.
- */
-static bool is_sid_match(const struct cred *cred, u32 cached_sid,
-			 const char *fallback_context)
+bool is_ksu_domain()
 {
-	const taskcred_sec_t *tsec;
-	if (!cred) {
-		return false;
-	}
-
-	tsec = (const taskcred_sec_t *)selinux_cred(cred);
-	if (!tsec) {
-		return false;
-	}
-
-	// Fast path: use cached SID if available
-	if (likely(cached_sid != 0)) {
-		return tsec->sid == cached_sid;
-	}
-
-	// Slow path fallback: string comparison (only before cache is initialized)
-	struct lsm_context ctx = { 0 };
+	char *domain;
+	u32 seclen;
 	bool result;
-	int err = __security_secid_to_secctx(tsec->sid, &ctx);
+	int err = security_secid_to_secctx(current_sid(), &domain, &seclen);
 	if (err) {
 		return false;
 	}
-	result = strncmp(fallback_context, ctx.context, ctx.len) == 0;
-	__security_release_secctx(&ctx);
+	result = strncmp(KERNEL_SU_DOMAIN, domain, seclen) == 0;
+	security_release_secctx(domain, seclen);
 	return result;
 }
 
-bool is_task_ksu_domain(const struct cred *cred)
+bool is_zygote(void *sec)
 {
-	return is_sid_match(cred, cached_su_sid, KERNEL_SU_CONTEXT);
+	struct task_security_struct *tsec = (struct task_security_struct *)sec;
+	if (!tsec) {
+		return false;
+	}
+	char *domain;
+	u32 seclen;
+	bool result;
+	int err = security_secid_to_secctx(tsec->sid, &domain, &seclen);
+	if (err) {
+		return false;
+	}
+	result = strncmp("u:r:zygote:s0", domain, seclen) == 0;
+	security_release_secctx(domain, seclen);
+	return result;
 }
 
-bool is_ksu_domain(void)
-{
-	return is_task_ksu_domain(current_cred());
-}
+#define DEVPTS_DOMAIN "u:object_r:devpts:s0"
 
-bool is_zygote(const struct cred *cred)
+u32 ksu_get_devpts_sid()
 {
-	return is_sid_match(cred, cached_zygote_sid, ZYGOTE_CONTEXT);
-}
-
-bool is_init(const struct cred *cred)
-{
-	return is_sid_match(cred, cached_init_sid, INIT_CONTEXT);
+	u32 devpts_sid = 0;
+	int err = security_secctx_to_secid(DEVPTS_DOMAIN, strlen(DEVPTS_DOMAIN),
+					   &devpts_sid);
+	if (err) {
+		pr_info("get devpts sid err %d\n", err);
+	}
+	return devpts_sid;
 }
